@@ -1,0 +1,37 @@
+[project]
+name = "location-movement-poc"
+version = "0.1.0"
+description = "FOLIO API testing for location and movement operations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "LICENSE"}
+authors = [
+    {name = "Wellcome Collection"}
+]
+dependencies = [
+    "requests>=2.31.0",
+    "certifi>=2024.0.0",
+    "truststore>=0.10.4",
+    "jupyter>=1.0.0",
+    "ipython>=8.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/location_movement_poc"]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88

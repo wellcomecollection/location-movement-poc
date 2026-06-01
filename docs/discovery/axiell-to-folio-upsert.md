@@ -2,7 +2,21 @@
 
 ## Summary
 
-Every time the Axiell Collections (AxC) adapter runs (trigger → loader → transformer), the pipeline should also upsert item-level data into FOLIO. Source MARCXML from Axiell is transformed via XSL into FOLIO-compatible payloads and written to FOLIO Inventory APIs.
+The strategy for syncing Axiell Collections (AxC) data into FOLIO has three phases:
+
+1. **Initial Load** — One-off bulk migration of all existing AxC records into FOLIO to establish a baseline.
+2. **Data Sync (AxC Adapter → FOLIO)** — Wire the existing AxC adapter pipeline so that every harvest also writes to FOLIO via a new upserter step.
+3. **Ongoing 15-minute Upserts** — After the initial load, the adapter continues on its 15-minute window cadence, incrementally upserting only changed records into FOLIO.
+
+Source MARCXML from Axiell is transformed via XSL into FOLIO-compatible payloads and written to FOLIO Inventory APIs.
+
+### Source-of-Truth Model
+
+- Records migrated from Sierra to FOLIO remain **FOLIO source of truth**.
+- Records migrated to AxC become **Axiell source of truth**.
+- Stub records will exist in both systems and must be identifiable as stubs so that human-editing only happens in the source system.
+- The minimum sync requirement is **AxC → FOLIO** to enable requesting and circulation.
+- Minimal metadata to be synced between systems is still being defined (Collections Information / Louise Grainger).
 
 ---
 
@@ -39,6 +53,7 @@ EventBridge Scheduler
 - **Identity**: `axiell-guid` from MARC 001
 - **Visibility**: `InvisibleSourceWork` (MimsyWorksAreNotVisible)
 - **Window cadence**: 15 min windows, 7 day lookback, 360 min max lag
+- **FOLIO OAI-PMH feed**: FOLIO exposes an OAI-PMH feed that is available every 15 minutes as well
 - **Storage**: Single Iceberg table schema (`namespace`, `id`, `content`, `changeset`, `last_modified`, `deleted`)
 
 ### What the Transformer Currently Does
@@ -320,6 +335,62 @@ FOLIO provides **batch synchronous** endpoints in `mod-inventory-storage` (not `
 | Incremental run (10-50 records/window) | Individual PUT/POST per record | Simpler error handling per record |
 | Partial field update only | PATCH | Avoids overwriting fields managed by other systems |
 | Record deletion | PUT with `discoverySuppress=true` or DELETE | Soft-delete preferred to preserve history |
+
+```
+
+### Phase 0 — Initial Load (Bulk Backfill)
+
+A one-off job that migrates the full AxC dataset into FOLIO before the incremental pipeline is enabled.
+
+| Step | Detail |
+|------|--------|
+| Extract | Harvest **all** records from AxC OAI-PMH (full dump, no time window filter). |
+| Transform | Apply XSL to produce FOLIO payloads (same stylesheet used by incremental path). |
+| Load | Batch upsert via `POST /item-storage/batch/synchronous?upsert=true` in chunks of 250–500. |
+| Parent entities | Pre-create or link required instances and holdings; maintain mapping table `(axiell_guid → folio_uuid)`. |
+| Validation | Sample-check created records in staging; compare counts AxC vs FOLIO. |
+| Completion gate | Mark initial-load manifest as complete; this unlocks Phase 1. |
+
+**Operational notes:**
+- Run as an offline / one-shot Step Function (or ECS task) with retries and exponential backoff.
+- Use deterministic UUID5 from `axiell-guid` so records are re-runnable without duplication.
+- Structured logging captures `action=backfill_created` or `backfill_skipped`.
+
+### Phase 1 — Data Sync via AxC Adapter
+
+Once the initial load is complete, enable the FOLIO upserter as a fan-out target on the existing adapter pipeline (see Target Architecture diagram above).
+
+- EventBridge routes `changeset_ids` to **both** ES transformer and FOLIO upserter.
+- The FOLIO upserter reads only the rows for those changesets from Iceberg.
+- Each record is matched to FOLIO by `axiell-guid` (resolved via local mapping table or CQL lookup).
+- Creates, updates, or suppresses records as appropriate.
+- This phase validates the incremental path works correctly on real traffic before committing to the 15-minute cadence.
+
+### Phase 2 — Ongoing 15-Minute Upserts (Steady State)
+
+With Phases 0 and 1 proven, the system enters steady state:
+
+```
+Every 15 minutes:
+  1. Trigger computes next harvest window.
+  2. Loader harvests changed records from AxC OAI-PMH → Iceberg.
+  3. Fan-out:
+     a. ES Transformer indexes to Elasticsearch.
+     b. FOLIO Upserter transforms via XSL → upserts to FOLIO Inventory.
+```
+
+**Characteristics:**
+- Small changeset sizes (typically 10–50 records per window).
+- Per-record upsert (GET → PUT/POST) for simpler error handling at low volume.
+- Payload hashing skips unchanged items to reduce unnecessary API calls.
+- Bounded concurrency (5–20 workers) with backoff on 429/5xx.
+- Idempotent by `axiell-guid`; safe to replay.
+
+### Reconciliation
+
+- Use FOLIO's own OAI-PMH feed (also available every 15 minutes) as a cross-check signal to detect drift.
+- Periodic reconciliation job compares AxC source hashes vs FOLIO-stored hashes and flags discrepancies.
+- Reconciler handles GUID remaps (identity superseded → suppress old record in FOLIO).
 
 ---
 
